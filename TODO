@@ -1,0 +1,133 @@
+# TODO — Navi
+
+WhatsApp-native AI assistant for notes, TODOs, reminders, scheduling, and social coordination.
+Named after Link's fairy companion in The Legend of Zelda — the one who never lets you forget.
+
+## Tech Stack
+
+- **Backend**: Laravel 12 (PHP 8.4) — API, business logic, queue jobs, user/billing data
+- **AI Orchestration**: OpenClaw — WhatsApp channel (Baileys), multi-model routing, session management, skill plugins
+- **Context Database**: OpenViking — memory extraction (8 categories), semantic search, hierarchical retrieval (L0/L1/L2), social context graph
+- **LLM**: Claude (complex reasoning, summarization) / Gemini (high-volume routine tasks — cost-optimized)
+- **Relational Database**: PostgreSQL — users, subscriptions, audit logs, billing, system config
+- **Cache/Queue**: Redis — job queue, rate limiting, OpenClaw Gateway pubsub
+- **WhatsApp**: Via OpenClaw's Baileys integration (QR code pairing, DM + group chat, media handling)
+
+### Database Architecture Decision
+
+PostgreSQL + OpenViking (dual-database strategy):
+- **PostgreSQL** handles structured relational data: user accounts, subscriptions, billing records, API usage tracking, system configuration. Standard Laravel Eloquent models.
+- **OpenViking** handles the context layer: user memories (profile, preferences, entities, events, cases, patterns), conversation sessions, knowledge resources, and the social coordination graph. Its 8-category automatic memory extraction maps directly to the app's core value — understanding users deeply over time. The L0/L1/L2 hierarchical information model (abstract ~100 tokens → overview ~2K tokens → full detail) minimizes LLM token consumption during retrieval. Relations API models edges in the social graph (who coordinates with whom, about what, how frequently).
+- No separate graph database needed. OpenViking's relations + semantic search cover graph traversal and context-aware queries. PostgreSQL covers everything that needs ACID transactions and traditional indexing.
+
+### OpenClaw Integration Path
+
+Laravel communicates with OpenClaw Gateway via the `brunocfalcao/laravel-openclaw-bridge` Composer package (facade API, persistent memory, streaming support). OpenClaw owns the WhatsApp connection — Laravel never touches Baileys directly. Message flow: WhatsApp → OpenClaw Gateway → Laravel webhook/bridge → OpenViking context retrieval → LLM → response back through the chain.
+
+### OpenViking Integration Path
+
+Laravel communicates with OpenViking via its REST API (`http://localhost:1933`). Key operations: session creation, message recording, memory commit (triggers automatic extraction), semantic search, resource management, relation linking. No native PHP SDK exists — use Laravel HTTP facade with a thin service wrapper. Multi-tenant support built into OpenViking maps to per-user context isolation.
+
+---
+
+## Tier 0 — Foundation & Infrastructure
+
+1. **Project scaffolding** — Initialize Laravel 12 project in `api/` directory. Docker Compose with services: app (Laravel FPM + Nginx), pgsql (PostgreSQL 18), redis (Redis 7), openclaw (Gateway), openviking (context DB). Multi-stage Dockerfile (base → dev → production). `.env.example` with all service connection vars. PER code style via Laravel Pint (`pint.json`). Pest testing framework. Match breakthrough project's directory structure and naming conventions exactly.
+
+2. **Git & CI infrastructure** — Conventional commits via commitlint + Husky (root-level `package.json`, `commitlint.config.mjs`, `.gitmessage` template). GitHub Actions CI pipeline: backend-lint, backend-test, dependency-audit. `.gitignore` for OS, IDE, Claude Code, node_modules, vendor, .env files.
+
+3. **OpenClaw deployment & WhatsApp channel** — Deploy OpenClaw Gateway as Docker service. Configure WhatsApp channel with Baileys (QR code pairing). Set DM policy (`pairing` initially — unknown senders get approval code). Configure media handling (images, audio, video, documents). Verify bidirectional message flow: send text from WhatsApp → Gateway receives → can route to Laravel.
+
+4. **OpenViking deployment & Laravel integration** — Deploy OpenViking as Docker service (HTTP server mode, port 1933). Create Laravel service class (`App\Services\OpenVikingService`) wrapping REST API calls. Configure VLM provider (Claude or Gemini for embeddings/extraction). Verify: create session → add message → commit → memory extracted.
+
+5. **OpenClaw ↔ Laravel bridge** — Install `brunocfalcao/laravel-openclaw-bridge`. Configure Gateway URL and token in `.env`. Build the core message pipeline: OpenClaw receives WhatsApp message → triggers Laravel webhook/bridge → Laravel processes → returns response → OpenClaw sends back via WhatsApp. Handle text, images, audio, and document media types.
+
+6. **Documentation foundation** — `CLAUDE.md` (architecture, quick commands, request flow, deployment). `README.md` (quick start, tech stack, repo structure). `SERVICES.md` (external service accounts — OpenClaw, OpenViking, Anthropic/Google, WhatsApp). Match breakthrough project's documentation depth and format.
+
+## Tier 1 — Core Agent: Conversational Intelligence
+
+7. **Message processing pipeline** — Full request lifecycle: WhatsApp message arrives → OpenClaw routes to Laravel → Laravel creates OpenViking session (or resumes existing) → records message → retrieves relevant context (memories, resources) via semantic search → constructs LLM prompt with context → sends to Claude/Gemini → streams response back through OpenClaw → WhatsApp. Handle graceful failures at each step. Job-based processing via Redis queue (match breakthrough's `ProcessMessageJob` pattern).
+
+8. **Multi-modal input processing** — Text: direct processing. Audio: WhatsApp voice notes arrive as `.ogg` files via OpenClaw media handling — transcribe (Whisper API or Gemini) before processing. Images: receive via OpenClaw, store in OpenViking as resources (auto-parsed with VLM), extract semantic description, link to conversation context. Documents: PDF/DOCX received via WhatsApp, ingested into OpenViking with full parsing. All modalities converge into the same context pipeline.
+
+9. **Session & memory persistence** — OpenViking sessions map 1:1 with WhatsApp conversations (per-user DM = one long-running session). After each interaction, commit session to trigger OpenViking's automatic memory extraction across 8 categories (profile, preferences, entities, events, cases, patterns, tools, skills). Laravel tracks session mappings in PostgreSQL (`user_whatsapp_sessions` table). Context budget management — OpenViking's L0/L1/L2 model keeps token usage under control.
+
+10. **Conversational UX foundations** — Natural language understanding for intent detection (the user says "remind me" vs "note this down" vs "schedule a meeting" vs just chatting). System prompt engineering for Navi's personality: helpful, concise, proactive but not annoying. WhatsApp-native formatting (bold, italic, monospace, lists — WhatsApp's subset of markdown). Response length calibration (WhatsApp is a chat app — responses should be short unless the user asks for detail).
+
+## Tier 2 — Individual Features (Stickiness Priority)
+
+### 2A — TODO Lists + Daily Reminders (highest stickiness)
+
+11. **TODO CRUD via natural language** — User says "add buy groceries to my list" or "todo: call dentist" or sends a voice note about tasks → Navi extracts TODO items, confirms, persists. Storage: OpenViking resources (semantically searchable) + PostgreSQL (`todos` table for structured queries — due dates, priority, completion status). Support multiple lists ("work", "personal", "groceries"). List/view/complete/delete via natural commands ("what's on my list?", "done with groceries", "clear completed").
+
+12. **Daily reminder system** — Scheduled job (Laravel scheduler + Redis queue) that runs at user-configured time (default 8:00 AM local timezone). Queries active TODOs, composes a morning digest, sends via OpenClaw → WhatsApp. Smart prioritization: overdue items first, then today's items, then upcoming. Configurable frequency ("remind me every morning", "only on weekdays", "don't remind me on weekends"). Snooze support ("remind me about this later", "push this to tomorrow").
+
+13. **Ad-hoc reminders** — "Remind me to call Maria at 3pm", "remind me about the report on Friday". Time parsing from natural language (handle relative: "in 2 hours", "tomorrow morning", "next Monday"; and absolute: "April 10th at 9am"). Timezone-aware. Persist in PostgreSQL (`reminders` table) with a scheduled job that checks and fires via OpenClaw → WhatsApp at the right time.
+
+### 2B — Scheduling + Calendar Integration
+
+14. **Appointment creation via natural language** — "Schedule a meeting with the team on Thursday at 2pm", "I have a dentist appointment next Tuesday at 10am". Parse event details (title, datetime, duration, location, participants). Store in PostgreSQL (`events` table). Confirm with user before creating.
+
+15. **Google Calendar integration** — OAuth2 flow initiated via WhatsApp ("connect my Google Calendar" → Navi sends auth link → user completes in browser → callback stores tokens in PostgreSQL). Two-way sync: events created in Navi push to Google Calendar; Google Calendar events pulled into Navi's context. Google Meet link generation for meetings. Use Google Calendar API v3. Handle token refresh, scope management, calendar selection.
+
+16. **Schedule-aware reminders** — Morning digest includes today's calendar events alongside TODOs. Pre-event reminders (configurable: 15min, 30min, 1hr before). Conflict detection ("you have a meeting at 2pm, but you also scheduled a dentist appointment at 2:30pm"). Weekly summary option ("here's your week ahead").
+
+### 2C — Note-Taking + Summarization
+
+17. **Note capture from any modality** — Text notes: direct save. Voice notes: transcribe → summarize → save both transcript and summary. Images: describe via VLM → save description + image reference. Documents: parse via OpenViking → save summary + full content. All notes stored in OpenViking as resources with semantic indexing. PostgreSQL `notes` table for metadata (title, created_at, tags, source_type).
+
+18. **Note linking & retrieval** — Automatic linking: OpenViking's semantic search connects related notes ("that restaurant idea I had last week"). Manual tagging via natural language ("tag this as work", "file this under trip planning"). Search via natural language queries ("what did I note about the budget meeting?", "find my notes from March"). OpenViking's L0 abstracts enable fast scanning; L2 detail loaded on demand.
+
+19. **Summarization engine** — On-demand summarization of accumulated notes ("summarize my notes from this week", "what are the key points from my project notes?"). Periodic automatic summaries (weekly digest of all notes). Summarization uses the LLM with OpenViking context retrieval — pulls all relevant notes, generates concise summary, stores summary as a new linked resource. Cost-optimized: use Gemini for routine summarization, Claude for complex multi-source synthesis.
+
+### 2D — Email Dictation
+
+20. **Email composition via voice/text** — "Send an email to juan@example.com saying I'll be late to the meeting". Parse: recipient, subject (auto-generated or specified), body. Draft preview sent back in WhatsApp for confirmation before sending. Support dictation flow: "new email to Maria" → Navi asks for subject → user dictates body → preview → "send it" / "change the subject" / "add a paragraph about X".
+
+21. **Email sending integration** — SMTP or transactional email service (Resend, matching breakthrough project). OAuth2 for Gmail send-as (user sends from their own address, not Navi's). Store sent email records in PostgreSQL for context. Handle attachments: user sends a document in WhatsApp → "email this to Juan" → document attached to email.
+
+### 2E — Affordance Communication (Critical UX Challenge)
+
+22. **Progressive feature discovery** — The user explicitly called this out: avoid becoming a glorified TODO list by failing to communicate capabilities. Approach: contextual suggestions during natural conversation. If user sends a voice note and Navi transcribes it, mention: "I saved this as a note. I can also set a reminder or add this to your TODO list." First-interaction onboarding flow: brief capability overview via WhatsApp messages. Weekly "did you know?" tips based on unused features. Feature usage tracking in PostgreSQL to drive discovery prompts intelligently (don't suggest what they already use).
+
+## Tier 3 — Network Features (Metcalfe's Law)
+
+### 3A — Cross-User Delegation
+
+23. **Agent-mediated task delegation** — User A: "Ask Luis if he can cover my shift on Thursday." If Luis is a Navi user → Navi DMs Luis directly, negotiates, confirms, updates both users. If Luis is not a user → Navi informs User A and offers to send an invitation link. Delegation state machine in PostgreSQL (`delegations` table: requester, target, task, status, timestamps). Both users' OpenViking contexts updated with delegation outcomes.
+
+24. **Organic viral invitation loop** — Every failed delegation (target not a Navi user) is an invitation moment. Navi sends a WhatsApp message to the target: "[User A] wants to coordinate with you through Navi. [brief value prop]. [signup link]". Track invitation → signup → activation funnel in PostgreSQL. Referral bonuses (extended features, priority reminders) for users whose invitations convert.
+
+### 3B — Multi-Party Scheduling
+
+25. **N-body scheduling** — "Find a time that works for me, Luis, and Maria for lunch this week." If all three are Navi users → query each user's calendar/events → find intersections → propose options → each user confirms via their WhatsApp chat with Navi. Constraint propagation algorithm for finding optimal slots across multiple calendars with preferences (preferred times, lunch vs dinner, travel time).
+
+26. **Group event coordination** — Trip planning, dinner parties, team meetings. One user initiates → Navi creates a coordination session → polls participants for preferences → converges on plan → creates events for all participants. Shared context stored in OpenViking with cross-user relation links.
+
+### 3C — Group Chat Memory
+
+27. **WhatsApp group chat integration** — Users add Navi to WhatsApp group chats (OpenClaw supports group channels). Navi becomes the persistent memory of the group. "What did we decide about the trip?" → Navi searches group conversation history via OpenViking. Configurable: active (responds to queries, participates) vs passive (only responds when mentioned or directly asked).
+
+28. **Group action item tracking** — Navi automatically detects commitments in group conversation ("I'll bring the wine", "Maria will book the Airbnb"). Tracks who committed to what. Follow-up reminders to individuals via DM ("You mentioned you'd book the Airbnb for the weekend trip — just checking in"). Group accountability without public shaming.
+
+### 3D — Shared Lists & Projects
+
+29. **Collaborative TODO lists** — Shared grocery lists, trip packing lists, project task lists. Any participant can add/complete/remove items via their DM with Navi. Changes broadcast to all participants. Conflict resolution (two people mark the same item done → acknowledge both).
+
+30. **Coordination graph accumulation** — Over time, OpenViking accumulates the social coordination graph: who coordinates with whom, about what, how frequently, who follows through, who needs extra reminders. This behavioral model is the core moat — impossible for a new entrant to replicate. Used for: intelligent reminder timing, delegation reliability scoring (internal, never exposed), proactive coordination suggestions ("You and Maria usually plan a weekend outing around this time of month").
+
+## Tier 4 — Growth, Polish & Monetization
+
+31. **Onboarding optimization** — First-message experience. A/B test different onboarding flows (guided tour vs immediate use vs capability showcase). Measure time-to-first-value (how quickly a new user creates their first TODO/reminder). Optimize for "aha moment" — the point where a user realizes this is more than a chatbot.
+
+32. **Analytics & instrumentation** — User engagement metrics: daily active users, messages per user, feature adoption rates, retention curves. Track per-feature stickiness (which features correlate with long-term retention?). OpenViking usage metrics: memory growth rate, search effectiveness, context retrieval latency. Cost metrics: LLM token consumption per user, per feature, per model.
+
+33. **Monetization strategy** — Freemium model. Free tier: TODO lists, basic reminders, limited notes. Paid tier: calendar integration, email dictation, unlimited notes, priority LLM processing (Claude over Gemini). Team/family tier: network features (delegation, multi-party scheduling, group memory, shared lists). Usage-based pricing for high-volume users.
+
+34. **Multi-language support** — Spanish first (matching breakthrough project's i18n infrastructure). System prompts, onboarding messages, error messages, feature discovery tips all localized. OpenViking handles multilingual content natively (semantic search works across languages). Follow breakthrough project's i18n conventions: JSON locale files, `trans()` calls, CI key parity checks.
+
+---
+
+## Done
+
+(Nothing yet — project initialized on 2026-04-05.)
