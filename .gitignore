@@ -1,0 +1,14 @@
+# OS
+.DS_Store
+
+# IDE
+/.fleet
+/.idea
+/.vscode
+
+# Claude Code
+.claude/
+.mcp.json
+
+# Root node_modules (husky + commitlint)
+/node_modules
