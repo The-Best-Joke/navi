@@ -8,6 +8,14 @@
 
 # Claude Code
 .claude/
+
+# Codex
+.codex
+.codex/
+
+# Gemini CLI
+.gemini/
+
 .mcp.json
 
 # Root node_modules (husky + commitlint)
