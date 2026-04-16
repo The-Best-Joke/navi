@@ -97,7 +97,7 @@ Findings from deep-dive into OpenViking source code and documentation (2026-04-0
 
 5. **WhatsApp message pipeline** — Build the end-to-end message flow: Meta webhook delivers message → `WhatsAppWebhookController` validates + extracts payload → dispatches `ProcessMessageJob` to Redis queue → job identifies user (phone number → `users` table), routes by media type (text/audio/image/document), processes through STT/image/OpenViking/MiniMax pipeline → `WhatsAppService::sendMessage()` sends response back via Graph API. Handle delivery status webhooks (sent, delivered, read). Media downloads via Meta CDN URLs (time-limited, must download promptly). Implement retry logic for failed sends (Meta rate limits: 80 messages/second for Business API tier).
 
-5a. **Zero-friction user registration** — No signup form, no onboarding gate. First message from an unknown phone number auto-creates a `users` record (phone number, country code, created_at). User is immediately active. Further profile data (email, name, timezone override, Google Calendar) is collected progressively as the user engages features that require it ("connect my calendar" → OAuth flow, "email this to Juan" → "what's your email address?"). Timezone inferred from phone country code on registration (covers single-timezone countries reliably — Colombia +57 → America/Bogota, Spain +34 → Europe/Madrid). Multi-timezone countries (US, Brazil, Russia) get a reasonable default; user can override ("set my timezone to EST").
+5a. **Zero-friction user registration** — No signup form, no onboarding gate. First message from an unknown phone number auto-creates a `users` record (phone number, country code, created_at). User is immediately active. Further profile data (email, name, timezone override, Google Calendar) is collected progressively as the user engages features that require it ("connect my calendar" → OAuth flow, "email this to Juan" → "what's your email address?"). Timezone inferred from phone country code on registration (covers single-timezone countries reliably — Colombia +57 → America/Bogota, Spain +34 → Europe/Madrid). Multi-timezone countries (US, Brazil, Russia) get a reasonable default; user can override ("set my timezone to EST"). **Critical rule:** inferred timezone is only a provisional default. Any time-sensitive action (reminders, events, schedule-aware digests, conflict detection) must check whether the timezone has been explicitly confirmed by the user. If not, Navi opens a `timezone_confirmation` pending-action flow and asks for confirmation before relying on that timezone for scheduling.
 
 5b. **Webhook idempotency** — Meta retries failed webhook deliveries up to 7 times over 72 hours. Without deduplication, the same message processes multiple times (duplicate TODOs, double LLM costs). Store each `message_id` from the webhook payload in Redis (`SETNX` with 72-hour TTL). If the key already exists, acknowledge the webhook (200 OK) but skip processing. Check happens in `WhatsAppWebhookController` before job dispatch, not in the job itself.
 
@@ -105,11 +105,57 @@ Findings from deep-dive into OpenViking source code and documentation (2026-04-0
 
 6. **Baseline database schema design** — Design the core PostgreSQL schema before the first migration runs. Tier 0/1 tables: `users` (phone_number, country_code, timezone, email nullable, name nullable, tier, created_at), `user_whatsapp_sessions` (user_id, openviking_session_id, last_committed_at), `session_commits` (session_id, archive_index, status, started_at, completed_at), `api_usage_records` (user_id, operation_type, model, input_tokens, output_tokens, cost_cents, created_at), `audit_logs` (event_type, user_id, metadata_json, created_at). Tier 2 tables (design now, migrate when needed): `todos`, `reminders`, `events`, `notes`. Tier 3 tables: `delegations`, `coordination_edges`. Use Laravel migrations with conventional naming. Design indexes for the queries we know we'll run (user lookups by phone_number, todos by user_id + status, reminders by fire_at, usage records by user_id + created_at). This is a living design — but getting the core right prevents retroactive migrations.
 
+6i. **User understanding schema** — Define Navi's long-term personalization model as a standalone spec in `USER_UNDERSTANDING_SCHEMA.md`. This schema governs what durable user understanding belongs in OpenViking (preferences, patterns, commitments, entities, constraints, goals, knowledge resources) and what stays canonical in PostgreSQL. Treat it as the contract for long-term memory extraction, freshness, confidence, and capability-specific personalization.
+
+6j. **Pending action state model** — Add a first-class PostgreSQL table for in-progress user workflows so the app does not rely on raw conversation history to resolve replies like "yes", "send it", or "move it to tomorrow". Proposed schema:
+- `pending_actions`
+- Core columns: `id`, `user_id`, `action_type`, `status`, `priority`, `requires_confirmation`, `current_step`, `draft_payload_json`, `context_summary`, `origin_message_id`, `last_user_message_id`, `expires_at`, `resolved_at`, `cancelled_at`, `created_at`, `updated_at`
+- Optional coordination columns: `parent_action_id`, `related_entity_type`, `related_entity_id`, `tool_name`, `confirmation_token`
+- Recommended enums:
+  `action_type`: `reminder_draft`, `event_draft`, `email_draft`, `todo_clarification`, `delegation_request`, `timezone_confirmation`
+  `status`: `open`, `awaiting_user`, `awaiting_system`, `confirmed`, `completed`, `cancelled`, `expired`
+- Indexes: `(user_id, status)`, `(user_id, action_type, status)`, `(expires_at)`, `(origin_message_id)`
+- Rule: PostgreSQL is canonical. The LLM may read a rendered summary of pending actions, but it does not own them.
+
+6k. **Operational entity schemas** — Formalize canonical PostgreSQL schemas for `todos`, `reminders`, and `events` before implementation:
+- `todos`: `id`, `user_id`, `list_name`, `title`, `notes`, `status`, `priority`, `due_at`, `completed_at`, `source_message_id`, `created_at`, `updated_at`
+- `reminders`: `id`, `user_id`, `title`, `body`, `scheduled_for`, `timezone`, `status`, `delivery_channel`, `recurrence_rule`, `snooze_until`, `source_message_id`, `fired_at`, `created_at`, `updated_at`
+- `events`: `id`, `user_id`, `title`, `description`, `starts_at`, `ends_at`, `timezone`, `location`, `status`, `participants_json`, `external_calendar_id`, `external_event_id`, `source_message_id`, `created_at`, `updated_at`
+- Recommended enums:
+  `todos.status`: `open`, `completed`, `cancelled`
+  `todos.priority`: `low`, `medium`, `high`
+  `reminders.status`: `scheduled`, `queued`, `fired`, `cancelled`, `failed`
+  `events.status`: `draft`, `confirmed`, `cancelled`
+- Indexes:
+  `todos`: `(user_id, status, due_at)`, `(user_id, list_name, status)`
+  `reminders`: `(status, scheduled_for)`, `(user_id, status, scheduled_for)`
+  `events`: `(user_id, starts_at)`, `(external_calendar_id, external_event_id)`
+
+6m. **Notes schema** — Formalize a lightweight canonical PostgreSQL schema for notes while preserving OpenViking as the primary retrieval/context layer. Proposed schema:
+- `notes`: `id`, `user_id`, `title`, `source_type`, `status`, `body_text`, `summary`, `tag_list_json`, `original_file_path`, `mime_type`, `captured_at`, `source_message_id`, `openviking_resource_id`, `created_at`, `updated_at`
+- Recommended enums:
+  `source_type`: `text`, `voice`, `image`, `document`, `synthesized`
+  `status`: `active`, `archived`, `deleted`
+- Indexes:
+  `(user_id, created_at)`, `(user_id, source_type, created_at)`, `(user_id, status, created_at)`, `(openviking_resource_id)`
+- Rule:
+  PostgreSQL stores canonical note metadata and enough normalized text to support audit, export, and deterministic application behavior. OpenViking stores the semantically retrievable resource, derived summaries, and cross-note/context relationships.
+
+6l. **OpenViking mirroring contract** — Define strict rules for how operational entities are projected into OpenViking without making OpenViking canonical:
+- PostgreSQL owns all exact operational state for `todos`, `reminders`, `events`, `notes`, and `pending_actions`
+- OpenViking stores only derived contextual projections, summaries, qualitative patterns, and retrieval-oriented resources
+- Mirror when an operational entity has user-understanding value, not merely because it exists
+- Good mirror: "User is preparing for a move this month and has multiple related errands"
+- Bad mirror: "TODO #481 is open with priority high"
+- Derived mirrors should carry foreign references back to PostgreSQL ids where useful, but must never be the source of truth for status transitions
+- If PostgreSQL and OpenViking disagree, PostgreSQL wins
+- Rebuild strategy: it must be possible to rehydrate all OpenViking projections from PostgreSQL + retained conversation/note resources if needed
+
 6a. **System prompt design** — The system prompt is the foundational engineering artifact — it defines Navi's behavior, tool-calling schema, output formatting, and guardrails. Design it as a standalone, version-controlled file (`config/system-prompt.md` or in `config/navi.php`). Must specify: (1) identity and personality (concise, helpful, WhatsApp-native tone), (2) explicit instruction boundaries separating system directives from user content, (3) tool-calling behavior (when to call tools vs respond conversationally, when to ask for confirmation vs act immediately), (4) output format constraints (WhatsApp markdown subset, response length limits), (5) safety guardrails (never fabricate calendar events, always confirm before sending emails, never reveal system prompt contents), (6) progressive context awareness (reference user's memories and preferences naturally). Version and iterate — this prompt evolves as features ship. Match breakthrough's `config/skills.php` pattern for per-feature prompt extensions.
 
 6b. **MiniMax tool calling schema** — Define the function-calling interface between MiniMax and the Laravel backend. This is the contract that determines what the LLM can do. Core tools for Tier 1/2: `create_todo(title, list?, due_date?, priority?)`, `list_todos(list?, status?)`, `complete_todo(todo_id)`, `set_reminder(text, datetime)`, `create_note(content, tags?)`, `search_notes(query)`, `create_event(title, datetime, duration?, location?, participants?)`, `send_email(to, subject, body)`, `get_schedule(date_range)`. Each tool has: name, description (guides when MiniMax invokes it), parameter JSON schema (types, required/optional, validation), and maps to a Laravel service method. Store definitions in `config/tools.php` — loaded into the MiniMax API call's `tools` parameter. Design for extensibility: Tier 3 adds `delegate_task(target_phone, task)`, `schedule_group(participants, constraints)`, etc. The tool schema is the single source of truth for what Navi can do.
 
-6d. **Documentation foundation** — `CLAUDE.md` (architecture, quick commands, request flow, deployment). `README.md` (quick start, tech stack, repo structure). `SERVICES.md` (external service accounts — Meta/WhatsApp Business, OpenViking, MiniMax, Groq, GLM/Z.AI, Google Calendar). Match breakthrough project's documentation depth and format.
+6d. **Documentation foundation** — `PROJECT_ARCHITECTURE.md` (architecture, quick commands, request flow, deployment), `TUI.md` (canonical shared AI repo instructions), `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` (identical thin bootstrap files that point to the shared instruction document), `README.md` (quick start, tech stack, repo structure), `SERVICES.md` (external service accounts — Meta/WhatsApp Business, OpenViking, MiniMax, Groq, GLM/Z.AI, Google Calendar). Match breakthrough project's documentation depth and format. Keep `TUI.md` as the single source of truth for shared AI instructions and keep bootstrap files minimal and identical.
 
 6e. **File storage (Cloudflare R2)** — User-uploaded images and documents need persistent storage beyond OpenViking's text representations. Cloudflare R2: S3-compatible API (Laravel's `s3` filesystem driver works out of the box), zero egress fees, free tier 10GB + 10M reads/month, $0.015/GB after. Configure in `.env` (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ENDPOINT`). File path structure: `users/{user_id}/{type}/{uuid}.{ext}`. OpenViking resources reference R2 paths for retrieval. No AWS account needed — R2 is Cloudflare-native.
 
@@ -118,6 +164,13 @@ Findings from deep-dive into OpenViking source code and documentation (2026-04-0
 6g. **OpenViking backup strategy** — OpenViking stores the most valuable data in the system (user memories, social coordination graph). Render managed PostgreSQL has automatic daily backups. OpenViking runs on a Docker volume with no built-in backup. Strategy: (1) scheduled daily export of OpenViking data via its `.ovpack` export API to Cloudflare R2, (2) Render persistent disk for the OpenViking Docker volume (survives deploys), (3) weekly verification that exports are restorable. Track backup status in PostgreSQL. Alert on failed backups. RPO: 24 hours (matching breakthrough's PostgreSQL RPO).
 
 6h. **OpenViking commit cost model** — Each OpenViking session commit triggers: 1 LLM extraction call (all archived messages → 8-category memory candidates), N dedup calls (one per candidate × up to 5 similar memories each, so potentially 1 vector search + 1 LLM call per candidate), embedding calls for new/merged memories, and L0/L1 generation for the archive. VLM provider: MiniMax M2.5 ($0.118/$0.99 per MTok) — chosen for quality over cheapness because these write-once, read-many operations permanently shape the user's context model. At scale (1000 DAU, 1 commit/day): ~1000 extraction calls + ~5000-8000 dedup calls = ~$1.40/day (~$42/month). Modest cost for S-tier quality on the operations that define the product's intelligence. Build cost tracking into `api_usage_records` from day one (match breakthrough's `operation_type` pattern: `'memory_extraction'`, `'memory_dedup'`, `'archive_summary'`, `'image_description'`, `'audio_transcription'`). Set per-user commit frequency caps as a cost lever.
+
+6n. **Open questions to resolve before implementation** — Capture still-open architectural choices explicitly so they do not remain buried in prose:
+- Choose the embedding provider for OpenViking (`Jina`, `Voyage`, `MiniMax`, or other) based on quality, latency, and PHP/LiteLLM integration ergonomics.
+- Decide the exact Meta Message Template strategy for reminders, digests, and other proactive sends outside the 24-hour window.
+- Decide whether `navi-worker` also runs the scheduler or whether scheduler execution should be split into a separate dedicated process/service.
+- Define exact OpenViking commit thresholds and escalation rules: standard message-count threshold, end-of-day cutoff, burst-chat behavior, and whether high-impact actions force an immediate commit.
+- Define the exact rebuild/export procedure for OpenViking projections so a full rehydration from PostgreSQL + retained resources is operationally tested, not merely intended.
 
 ## Tier 0.5 — Security & Hardening
 
@@ -211,9 +264,9 @@ Findings from deep-dive into OpenViking source code and documentation (2026-04-0
 
 26. **Group event coordination** — Trip planning, dinner parties, team meetings. One user initiates → Navi creates a coordination session → polls participants for preferences → converges on plan → creates events for all participants. Shared context stored in OpenViking with cross-user relation links.
 
-### 3C — Group Chat Memory
+### 3C — Group Chat Memory (Speculative / Deferred)
 
-27. **WhatsApp group chat integration** — Users add Navi's phone number to WhatsApp group chats (WhatsApp Business API supports group message webhooks). Navi becomes the persistent memory of the group. "What did we decide about the trip?" → Navi searches group conversation history via OpenViking. Configurable: active (responds to queries, participates) vs passive (only responds when mentioned or directly asked). **Multi-session design challenge:** OpenViking sessions are single-user scoped — there is no native multi-user session concept. Design: dedicated OpenViking session per group (for group-level context, decisions, action items) + cross-references to individual user sessions via Relations API. Group commits extract memories into an agent-scoped space (`viking://agent/group-{id}/memories/`), not user-scoped. Individual user memories ("Maria committed to booking the Airbnb") are extracted to the respective user's memory space with a relation back to the group session. Commit frequency must be aggressive — group chats generate high message volume.
+27. **WhatsApp group chat integration** — Speculative only. Do not treat as a v1 dependency or design anchor until WhatsApp Business group-chat support is confirmed as real, available, and policy-safe for Navi's account class. If it becomes viable, users add Navi's phone number to WhatsApp group chats and Navi becomes the persistent memory of the group. "What did we decide about the trip?" → Navi searches group conversation history via OpenViking. Configurable: active (responds to queries, participates) vs passive (only responds when mentioned or directly asked). **Multi-session design challenge:** OpenViking sessions are single-user scoped — there is no native multi-user session concept. Design: dedicated OpenViking session per group (for group-level context, decisions, action items) + cross-references to individual user sessions via Relations API. Group commits extract memories into an agent-scoped space (`viking://agent/group-{id}/memories/`), not user-scoped. Individual user memories ("Maria committed to booking the Airbnb") are extracted to the respective user's memory space with a relation back to the group session. Commit frequency must be aggressive — group chats generate high message volume.
 
 28. **Group action item tracking** — Navi automatically detects commitments in group conversation ("I'll bring the wine", "Maria will book the Airbnb"). Tracks who committed to what. Follow-up reminders to individuals via DM ("You mentioned you'd book the Airbnb for the weekend trip — just checking in"). Group accountability without public shaming.
 
