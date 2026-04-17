@@ -1,55 +1,11 @@
 {
   "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-filesystem",
-        "/home/asalazar/Projects/navi",
-        "/home/asalazar/.codex/memories",
-        "/tmp"
-      ]
+    "context7": {
+      "url": "https://mcp.context7.com/mcp"
     },
-    "git": {
+    "docker": {
       "command": "uvx",
-      "args": [
-        "mcp-server-git",
-        "--repository",
-        "/home/asalazar/Projects/navi"
-      ]
-    },
-    "postgres": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-postgres",
-        "postgresql://postgres:postgres@localhost:5432/naviDB"
-      ]
-    },
-    "redis": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-redis",
-        "redis://localhost:6379"
-      ]
-    },
-    "fetch": {
-      "command": "uvx",
-      "args": [
-        "mcp-server-fetch"
-      ]
-    },
-    "time": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-time"
-      ]
-    },
-    "sentry": {
-      "type": "http",
-      "url": "https://mcp.sentry.dev/mcp"
+      "args": ["docker-mcp"]
     },
     "github": {
       "command": "docker",
@@ -62,17 +18,23 @@
         "ghcr.io/github/github-mcp-server"
       ],
       "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "<YOUR_GITHUB_PAT>"
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
       }
     },
-    "context7": {
-      "url": "https://mcp.context7.com/mcp"
+    "render": {
+      "type": "http",
+      "url": "https://mcp.render.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${RENDER_API_KEY}"
+      }
     },
-    "docker": {
-      "command": "uvx",
-      "args": [
-        "docker-mcp"
-      ]
+    "sentry": {
+      "type": "http",
+      "url": "https://mcp.sentry.dev/mcp"
+    },
+    "time": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-time"]
     }
   }
 }
