@@ -1,3 +1,9 @@
+---
+title: User Understanding Schema — Navi
+category: memory-schema
+last_reviewed: 2026-04-16
+---
+
 # User Understanding Schema — Navi
 
 ## Purpose

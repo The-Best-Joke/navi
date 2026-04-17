@@ -1,3 +1,9 @@
+---
+title: Project Architecture — Navi
+category: project-overview
+last_reviewed: 2026-04-16
+---
+
 # Project Architecture — Navi
 
 ## Project Overview

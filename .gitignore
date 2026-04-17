@@ -7,7 +7,9 @@
 /.vscode
 
 # Claude Code
-.claude/
+.claude/*
+!.claude/settings.json
+!.claude/commands/
 
 # Codex
 .codex
@@ -16,7 +18,9 @@
 # Gemini CLI
 .gemini/
 
-.mcp.json
+# .mcp.json is committed — it defines project MCP servers (no credentials; those are in .env)
+.env
+.env.*
 
 # Root node_modules (husky + commitlint)
 /node_modules

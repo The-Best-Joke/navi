@@ -1,3 +1,9 @@
+---
+title: TUI Instructions — Navi
+category: agent-rules
+last_reviewed: 2026-04-16
+---
+
 # TUI Instructions — Navi
 
 Canonical shared instructions for all AI coding TUIs working in this repository.
